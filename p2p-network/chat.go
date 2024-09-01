@@ -13,6 +13,8 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"io"
+  "compress/zlib"
+  "bytes"
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v3"
@@ -189,71 +191,93 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 var secretKey = []byte("mysecretkey32byteslong1234567890")
 
 func encrypt(jsonStr string) (string, error) {
-	// Parse JSON to remove any unnecessary whitespace
-	var jsonData interface{}
-	err := json.Unmarshal([]byte(jsonStr), &jsonData)
-	if err != nil {
-		return "", fmt.Errorf("invalid JSON: %v", err)
-	}
-	
-	// Convert back to compact JSON
-	compactJSON, err := json.Marshal(jsonData)
-	if err != nil {
-		return "", fmt.Errorf("error compacting JSON: %v", err)
-	}
+    // Parse JSON to remove any unnecessary whitespace
+    var jsonData interface{}
+    err := json.Unmarshal([]byte(jsonStr), &jsonData)
+    if err != nil {
+        return "", fmt.Errorf("invalid JSON: %v", err)
+    }
+    
+    // Convert back to compact JSON
+    compactJSON, err := json.Marshal(jsonData)
+    if err != nil {
+        return "", fmt.Errorf("error compacting JSON: %v", err)
+    }
 
-	// Create cipher block
-	block, err := aes.NewCipher(secretKey)
-	if err != nil {
-		return "", err
-	}
+    // Compress the JSON
+    var compressed bytes.Buffer
+    w := zlib.NewWriter(&compressed)
+    _, err = w.Write(compactJSON)
+    if err != nil {
+        return "", fmt.Errorf("error compressing JSON: %v", err)
+    }
+    w.Close()
 
-	// Create GCM
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
-	}
+    // Create cipher block
+    block, err := aes.NewCipher(secretKey)
+    if err != nil {
+        return "", err
+    }
 
-	// Create nonce
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return "", err
-	}
+    // Create GCM
+    gcm, err := cipher.NewGCM(block)
+    if err != nil {
+        return "", err
+    }
 
-	// Encrypt
-	ciphertext := gcm.Seal(nonce, nonce, compactJSON, nil)
-	return base64.StdEncoding.EncodeToString(ciphertext), nil
+    // Create nonce
+    nonce := make([]byte, gcm.NonceSize())
+    if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+        return "", err
+    }
+
+    // Encrypt
+    ciphertext := gcm.Seal(nonce, nonce, compressed.Bytes(), nil)
+    return base64.StdEncoding.EncodeToString(ciphertext), nil
 }
 
 func decrypt(encryptedStr string) (string, error) {
-	ciphertext, err := base64.StdEncoding.DecodeString(encryptedStr)
-	if err != nil {
-		return "", err
-	}
+    ciphertext, err := base64.StdEncoding.DecodeString(encryptedStr)
+    if err != nil {
+        return "", err
+    }
 
-	// Create cipher block
-	block, err := aes.NewCipher(secretKey)
-	if err != nil {
-		return "", err
-	}
+    // Create cipher block
+    block, err := aes.NewCipher(secretKey)
+    if err != nil {
+        return "", err
+    }
 
-	// Create GCM
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
-	}
+    // Create GCM
+    gcm, err := cipher.NewGCM(block)
+    if err != nil {
+        return "", err
+    }
 
-	// Extract nonce
-	if len(ciphertext) < gcm.NonceSize() {
-		return "", fmt.Errorf("ciphertext too short")
-	}
-	nonce, ciphertext := ciphertext[:gcm.NonceSize()], ciphertext[gcm.NonceSize():]
+    // Extract nonce
+    if len(ciphertext) < gcm.NonceSize() {
+        return "", fmt.Errorf("ciphertext too short")
+    }
+    nonce, ciphertext := ciphertext[:gcm.NonceSize()], ciphertext[gcm.NonceSize():]
 
-	// Decrypt
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		return "", err
-	}
+    // Decrypt
+    compressed, err := gcm.Open(nil, nonce, ciphertext, nil)
+    if err != nil {
+        return "", err
+    }
 
-	return string(plaintext), nil
+    // Decompress
+    r, err := zlib.NewReader(bytes.NewReader(compressed))
+    if err != nil {
+        return "", err
+    }
+    defer r.Close()
+
+    var decompressed bytes.Buffer
+    _, err = io.Copy(&decompressed, r)
+    if err != nil {
+        return "", err
+    }
+
+    return decompressed.String(), nil
 }

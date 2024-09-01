@@ -1,11 +1,18 @@
-package main
+// ¯\_(ツ)_/¯
 
+package main
+ 
 import (
 	"bufio"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/base64"
+	"io"
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v3"
@@ -38,7 +45,7 @@ func main() {
 
 	peerConnection.OnDataChannel(func(d *webrtc.DataChannel) {
 		fmt.Println("New DataChannel:", d.Label())
-    activeDataChannel = d
+		activeDataChannel = d
 		d.OnMessage(func(msg webrtc.DataChannelMessage) {
 			fmt.Printf("Message from DataChannel '%s': '%s'\n", d.Label(), string(msg.Data))
 		})
@@ -54,13 +61,13 @@ func main() {
 			if err != nil {
 				panic(err)
 			}
+			activeDataChannel = dataChannel
 
 			// Create an offer
 			offer, err := peerConnection.CreateOffer(nil)
 			if err != nil {
 				panic(err)
 			}
-      activeDataChannel = dataChannel
 
 			// Set the local description
 			err = peerConnection.SetLocalDescription(offer)
@@ -76,7 +83,12 @@ func main() {
 
 			// Marshal the offer to JSON
 			offerJSON, _ := json.Marshal(localDesc)
-			fmt.Println("Created offer. Send this to your peer:", string(offerJSON))
+			encrypted, err := encrypt(string(offerJSON))
+			if err != nil {
+				fmt.Println("Error encrypting offer:", err)
+				continue
+			}
+			fmt.Println("Created offer. Send this to your peer:", encrypted)
 
 			// Set up the data channel handlers
 			dataChannel.OnOpen(func() {
@@ -86,22 +98,28 @@ func main() {
 				fmt.Printf("Message from DataChannel: %s\n", string(msg.Data))
 			})
 		} else if text == "send" {
-      if activeDataChannel == nil {
-        fmt.Println("No active data channel. Establish a connection first.")
-        continue
-      }
-      fmt.Print("Enter message to send: ")
-      scanner.Scan()
-      message := scanner.Text()
-      err := activeDataChannel.SendText(message)
-      if err != nil {
-        fmt.Println("Error sending message:", err)
-      } else {
-        fmt.Println("Message sent successfully")
-      } 
-    } else {
+			if activeDataChannel == nil {
+				fmt.Println("No active data channel. Establish a connection first.")
+				continue
+			}
+			fmt.Print("Enter message to send: ")
+			scanner.Scan()
+			message := scanner.Text()
+			err := activeDataChannel.SendText(message)
+			if err != nil {
+				fmt.Println("Error sending message:", err)
+			} else {
+				fmt.Println("Message sent successfully")
+			}
+		} else {
+			decrypted, err := decrypt(text)
+			if err != nil {
+				fmt.Println("Error decrypting message:", err)
+				continue
+			}
+
 			var sd webrtc.SessionDescription
-			err := json.Unmarshal([]byte(text), &sd)
+			err = json.Unmarshal([]byte(decrypted), &sd)
 			if err != nil {
 				fmt.Println("Invalid SDP:", err)
 				continue
@@ -133,7 +151,12 @@ func main() {
 
 				// Marshal the answer to JSON
 				answerJSON, _ := json.Marshal(localDesc)
-				fmt.Println("Created answer. Send this to your peer:", string(answerJSON))
+				encrypted, err := encrypt(string(answerJSON))
+				if err != nil {
+					fmt.Println("Error encrypting answer:", err)
+					continue
+				}
+				fmt.Println("Created answer. Send this to your peer:", encrypted)
 			} else if sd.Type == webrtc.SDPTypeAnswer {
 				err = peerConnection.SetRemoteDescription(sd)
 				if err != nil {
@@ -161,4 +184,76 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+var secretKey = []byte("mysecretkey32byteslong1234567890")
+
+func encrypt(jsonStr string) (string, error) {
+	// Parse JSON to remove any unnecessary whitespace
+	var jsonData interface{}
+	err := json.Unmarshal([]byte(jsonStr), &jsonData)
+	if err != nil {
+		return "", fmt.Errorf("invalid JSON: %v", err)
+	}
+	
+	// Convert back to compact JSON
+	compactJSON, err := json.Marshal(jsonData)
+	if err != nil {
+		return "", fmt.Errorf("error compacting JSON: %v", err)
+	}
+
+	// Create cipher block
+	block, err := aes.NewCipher(secretKey)
+	if err != nil {
+		return "", err
+	}
+
+	// Create GCM
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+
+	// Create nonce
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", err
+	}
+
+	// Encrypt
+	ciphertext := gcm.Seal(nonce, nonce, compactJSON, nil)
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
+}
+
+func decrypt(encryptedStr string) (string, error) {
+	ciphertext, err := base64.StdEncoding.DecodeString(encryptedStr)
+	if err != nil {
+		return "", err
+	}
+
+	// Create cipher block
+	block, err := aes.NewCipher(secretKey)
+	if err != nil {
+		return "", err
+	}
+
+	// Create GCM
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+
+	// Extract nonce
+	if len(ciphertext) < gcm.NonceSize() {
+		return "", fmt.Errorf("ciphertext too short")
+	}
+	nonce, ciphertext := ciphertext[:gcm.NonceSize()], ciphertext[gcm.NonceSize():]
+
+	// Decrypt
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return "", err
+	}
+
+	return string(plaintext), nil
 }

@@ -1,26 +1,27 @@
-// ¯\_(ツ)_/¯
-
 package main
- 
+
 import (
 	"bufio"
-	"encoding/json"
-	"fmt"
-	"net/http"
-	"os"
+	"bytes"
+	"compress/zlib"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"io"
-  "compress/zlib"
-  "bytes"
+	"net/http"
+	"os"
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v3"
 )
 
-var activeDataChannel *webrtc.DataChannel
+type P2PChat struct {
+	peerConnection *webrtc.PeerConnection
+	dataChannels   map[string]*webrtc.DataChannel
+}
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
@@ -33,10 +34,24 @@ func main() {
 	go http.ListenAndServe(":8080", nil)
 
 	fmt.Println("P2P Chat started. Enter 'offer' to create an offer, or paste an offer/answer to connect.")
-	
-	peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+
+	chat, err := newP2PChat()
 	if err != nil {
 		panic(err)
+	}
+
+	runChatLoop(chat)
+}
+
+func newP2PChat() (*P2PChat, error) {
+	peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		return nil, err
+	}
+
+	chat := &P2PChat{
+		peerConnection: peerConnection,
+		dataChannels:   make(map[string]*webrtc.DataChannel),
 	}
 
 	peerConnection.OnICECandidate(func(i *webrtc.ICECandidate) {
@@ -47,126 +62,154 @@ func main() {
 
 	peerConnection.OnDataChannel(func(d *webrtc.DataChannel) {
 		fmt.Println("New DataChannel:", d.Label())
-		activeDataChannel = d
+		chat.dataChannels[d.Label()] = d
 		d.OnMessage(func(msg webrtc.DataChannelMessage) {
 			fmt.Printf("Message from DataChannel '%s': '%s'\n", d.Label(), string(msg.Data))
 		})
 	})
 
+	return chat, nil
+}
+
+func runChatLoop(chat *P2PChat) {
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		text := scanner.Text()
 
-		if text == "offer" {
-			// Create a data channel
-			dataChannel, err := peerConnection.CreateDataChannel("chat", nil)
-			if err != nil {
-				panic(err)
-			}
-			activeDataChannel = dataChannel
-
-			// Create an offer
-			offer, err := peerConnection.CreateOffer(nil)
-			if err != nil {
-				panic(err)
-			}
-
-			// Set the local description
-			err = peerConnection.SetLocalDescription(offer)
-			if err != nil {
-				panic(err)
-			}
-
-			// Wait for ICE gathering to complete
-			<-webrtc.GatheringCompletePromise(peerConnection)
-
-			// Get the local description with ICE candidates
-			localDesc := peerConnection.LocalDescription()
-
-			// Marshal the offer to JSON
-			offerJSON, _ := json.Marshal(localDesc)
-			encrypted, err := encrypt(string(offerJSON))
-			if err != nil {
-				fmt.Println("Error encrypting offer:", err)
-				continue
-			}
-			fmt.Println("Created offer. Send this to your peer:", encrypted)
-
-			// Set up the data channel handlers
-			dataChannel.OnOpen(func() {
-				fmt.Println("Data channel is open")
-			})
-			dataChannel.OnMessage(func(msg webrtc.DataChannelMessage) {
-				fmt.Printf("Message from DataChannel: %s\n", string(msg.Data))
-			})
-		} else if text == "send" {
-			if activeDataChannel == nil {
-				fmt.Println("No active data channel. Establish a connection first.")
-				continue
-			}
-			fmt.Print("Enter message to send: ")
-			scanner.Scan()
-			message := scanner.Text()
-			err := activeDataChannel.SendText(message)
-			if err != nil {
-				fmt.Println("Error sending message:", err)
-			} else {
-				fmt.Println("Message sent successfully")
-			}
-		} else {
-			decrypted, err := decrypt(text)
-			if err != nil {
-				fmt.Println("Error decrypting message:", err)
-				continue
-			}
-
-			var sd webrtc.SessionDescription
-			err = json.Unmarshal([]byte(decrypted), &sd)
-			if err != nil {
-				fmt.Println("Invalid SDP:", err)
-				continue
-			}
-
-			if sd.Type == webrtc.SDPTypeOffer {
-				err = peerConnection.SetRemoteDescription(sd)
-				if err != nil {
-					panic(err)
-				}
-
-				// Create an answer
-				answer, err := peerConnection.CreateAnswer(nil)
-				if err != nil {
-					panic(err)
-				}
-
-				// Set the local description
-				err = peerConnection.SetLocalDescription(answer)
-				if err != nil {
-					panic(err)
-				}
-
-				// Wait for ICE gathering to complete
-				<-webrtc.GatheringCompletePromise(peerConnection)
-
-				// Get the local description with ICE candidates
-				localDesc := peerConnection.LocalDescription()
-
-				// Marshal the answer to JSON
-				answerJSON, _ := json.Marshal(localDesc)
-				encrypted, err := encrypt(string(answerJSON))
-				if err != nil {
-					fmt.Println("Error encrypting answer:", err)
-					continue
-				}
-				fmt.Println("Created answer. Send this to your peer:", encrypted)
-			} else if sd.Type == webrtc.SDPTypeAnswer {
-				err = peerConnection.SetRemoteDescription(sd)
-				if err != nil {
-					panic(err)
-				}
-			}
+		switch text {
+		case "offer":
+			handleOffer(chat, scanner)
+		case "send":
+			handleSend(chat, scanner)
+		default:
+			handleSDPExchange(chat, text)
 		}
 	}
+}
+
+func handleOffer(chat *P2PChat, scanner *bufio.Scanner) {
+	dataChannel, err := chat.peerConnection.CreateDataChannel("chat", nil)
+	if err != nil {
+		fmt.Println("Error creating data channel:", err)
+		return
+	}
+	chat.dataChannels[dataChannel.Label()] = dataChannel
+
+	offer, err := createOffer(chat.peerConnection)
+	if err != nil {
+		fmt.Println("Error creating offer:", err)
+		return
+	}
+
+	offerJSON, _ := json.Marshal(offer)
+	encrypted, err := encrypt(string(offerJSON))
+	if err != nil {
+		fmt.Println("Error encrypting offer:", err)
+		return
+	}
+	fmt.Println("Created offer. Send this to your peer:", encrypted)
+
+	setupDataChannelHandlers(dataChannel)
+}
+
+func handleSend(chat *P2PChat, scanner *bufio.Scanner) {
+	if len(chat.dataChannels) == 0 {
+		fmt.Println("No active data channels. Establish a connection first.")
+		return
+	}
+
+	fmt.Print("Enter message to send: ")
+	scanner.Scan()
+	message := scanner.Text()
+
+	for label, dc := range chat.dataChannels {
+		err := dc.SendText(message)
+		if err != nil {
+			fmt.Printf("Error sending message on channel %s: %v\n", label, err)
+		} else {
+			fmt.Printf("Message sent successfully on channel %s\n", label)
+		}
+	}
+}
+
+func handleSDPExchange(chat *P2PChat, text string) {
+	decrypted, err := decrypt(text)
+	if err != nil {
+		fmt.Println("Error decrypting message:", err)
+		return
+	}
+
+	var sd webrtc.SessionDescription
+	err = json.Unmarshal([]byte(decrypted), &sd)
+	if err != nil {
+		fmt.Println("Invalid SDP:", err)
+		return
+	}
+
+	err = chat.peerConnection.SetRemoteDescription(sd)
+	if err != nil {
+		fmt.Println("Error setting remote description:", err)
+		return
+	}
+
+	if sd.Type == webrtc.SDPTypeOffer {
+		handleIncomingOffer(chat)
+	}
+}
+
+func handleIncomingOffer(chat *P2PChat) {
+	answer, err := createAnswer(chat.peerConnection)
+	if err != nil {
+		fmt.Println("Error creating answer:", err)
+		return
+	}
+
+	answerJSON, _ := json.Marshal(answer)
+	encrypted, err := encrypt(string(answerJSON))
+	if err != nil {
+		fmt.Println("Error encrypting answer:", err)
+		return
+	}
+	fmt.Println("Created answer. Send this to your peer:", encrypted)
+}
+
+func createOffer(peerConnection *webrtc.PeerConnection) (*webrtc.SessionDescription, error) {
+	offer, err := peerConnection.CreateOffer(nil)
+	if err != nil {
+		return nil, err
+	}
+
+	err = peerConnection.SetLocalDescription(offer)
+	if err != nil {
+		return nil, err
+	}
+
+	<-webrtc.GatheringCompletePromise(peerConnection)
+	return peerConnection.LocalDescription(), nil
+}
+
+func createAnswer(peerConnection *webrtc.PeerConnection) (*webrtc.SessionDescription, error) {
+	answer, err := peerConnection.CreateAnswer(nil)
+	if err != nil {
+		return nil, err
+	}
+
+	err = peerConnection.SetLocalDescription(answer)
+	if err != nil {
+		return nil, err
+	}
+
+	<-webrtc.GatheringCompletePromise(peerConnection)
+	return peerConnection.LocalDescription(), nil
+}
+
+func setupDataChannelHandlers(dataChannel *webrtc.DataChannel) {
+	dataChannel.OnOpen(func() {
+		fmt.Println("Data channel is open")
+	})
+	dataChannel.OnMessage(func(msg webrtc.DataChannelMessage) {
+		fmt.Printf("Message from DataChannel: %s\n", string(msg.Data))
+	})
 }
 
 func websocketHandler(w http.ResponseWriter, r *http.Request) {
@@ -188,96 +231,90 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-var secretKey = []byte("mysecretkey32byteslong1234567890")
+func getSecretKey() []byte {
+	key := os.Getenv("SECRET_KEY")
+	if key == "" {
+		key = "defaultsecretkey32byteslong12345"
+	}
+	return []byte(key)
+}
 
 func encrypt(jsonStr string) (string, error) {
-    // Parse JSON to remove any unnecessary whitespace
-    var jsonData interface{}
-    err := json.Unmarshal([]byte(jsonStr), &jsonData)
-    if err != nil {
-        return "", fmt.Errorf("invalid JSON: %v", err)
-    }
-    
-    // Convert back to compact JSON
-    compactJSON, err := json.Marshal(jsonData)
-    if err != nil {
-        return "", fmt.Errorf("error compacting JSON: %v", err)
-    }
+	var jsonData interface{}
+	err := json.Unmarshal([]byte(jsonStr), &jsonData)
+	if err != nil {
+		return "", fmt.Errorf("invalid JSON: %v", err)
+	}
 
-    // Compress the JSON
-    var compressed bytes.Buffer
-    w := zlib.NewWriter(&compressed)
-    _, err = w.Write(compactJSON)
-    if err != nil {
-        return "", fmt.Errorf("error compressing JSON: %v", err)
-    }
-    w.Close()
+	compactJSON, err := json.Marshal(jsonData)
+	if err != nil {
+		return "", fmt.Errorf("error compacting JSON: %v", err)
+	}
 
-    // Create cipher block
-    block, err := aes.NewCipher(secretKey)
-    if err != nil {
-        return "", err
-    }
+	var compressed bytes.Buffer
+	w := zlib.NewWriter(&compressed)
+	_, err = w.Write(compactJSON)
+	if err != nil {
+		return "", fmt.Errorf("error compressing JSON: %v", err)
+	}
+	w.Close()
 
-    // Create GCM
-    gcm, err := cipher.NewGCM(block)
-    if err != nil {
-        return "", err
-    }
+	block, err := aes.NewCipher(getSecretKey())
+	if err != nil {
+		return "", err
+	}
 
-    // Create nonce
-    nonce := make([]byte, gcm.NonceSize())
-    if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-        return "", err
-    }
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
 
-    // Encrypt
-    ciphertext := gcm.Seal(nonce, nonce, compressed.Bytes(), nil)
-    return base64.StdEncoding.EncodeToString(ciphertext), nil
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", err
+	}
+
+	ciphertext := gcm.Seal(nonce, nonce, compressed.Bytes(), nil)
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
 }
 
 func decrypt(encryptedStr string) (string, error) {
-    ciphertext, err := base64.StdEncoding.DecodeString(encryptedStr)
-    if err != nil {
-        return "", err
-    }
+	ciphertext, err := base64.StdEncoding.DecodeString(encryptedStr)
+	if err != nil {
+		return "", err
+	}
 
-    // Create cipher block
-    block, err := aes.NewCipher(secretKey)
-    if err != nil {
-        return "", err
-    }
+	block, err := aes.NewCipher(getSecretKey())
+	if err != nil {
+		return "", err
+	}
 
-    // Create GCM
-    gcm, err := cipher.NewGCM(block)
-    if err != nil {
-        return "", err
-    }
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
 
-    // Extract nonce
-    if len(ciphertext) < gcm.NonceSize() {
-        return "", fmt.Errorf("ciphertext too short")
-    }
-    nonce, ciphertext := ciphertext[:gcm.NonceSize()], ciphertext[gcm.NonceSize():]
+	if len(ciphertext) < gcm.NonceSize() {
+		return "", fmt.Errorf("ciphertext too short")
+	}
+	nonce, ciphertext := ciphertext[:gcm.NonceSize()], ciphertext[gcm.NonceSize():]
 
-    // Decrypt
-    compressed, err := gcm.Open(nil, nonce, ciphertext, nil)
-    if err != nil {
-        return "", err
-    }
+	compressed, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return "", err
+	}
 
-    // Decompress
-    r, err := zlib.NewReader(bytes.NewReader(compressed))
-    if err != nil {
-        return "", err
-    }
-    defer r.Close()
+	r, err := zlib.NewReader(bytes.NewReader(compressed))
+	if err != nil {
+		return "", err
+	}
+	defer r.Close()
 
-    var decompressed bytes.Buffer
-    _, err = io.Copy(&decompressed, r)
-    if err != nil {
-        return "", err
-    }
+	var decompressed bytes.Buffer
+	_, err = io.Copy(&decompressed, r)
+	if err != nil {
+		return "", err
+	}
 
-    return decompressed.String(), nil
+	return decompressed.String(), nil
 }
